@@ -1239,26 +1239,5 @@ body.map-fullscreen .stage { padding-top: 0; }
 <script src="config.runtime.js"></script>
 <script src="config.js"></script>
 <script src="responder.js"></script>
-<script>
-    /* Server connection pill — tap to configure the LAN URL override.
-     * Lets a responder retarget the APK at a new PC IP without a rebuild. */
-    (function initResponderServerPill() {
-        if (!window.RN_ShowServerPanel) return;
-        const pill = document.createElement('button');
-        pill.type = 'button';
-        pill.title = 'RescueNet server connection. Tap to configure.';
-        pill.style.cssText = 'position:fixed;right:10px;bottom:76px;z-index:9999;padding:5px 10px;border-radius:999px;border:1px solid rgba(16,45,92,0.14);background:rgba(255,255,255,0.94);color:#102d5c;font:600 10px/1 Inter,system-ui,sans-serif;letter-spacing:.3px;cursor:pointer;box-shadow:0 2px 8px rgba(16,45,92,0.12);display:flex;align-items:center;gap:6px;';
-        const dot = () => '<span style="width:6px;height:6px;border-radius:50%;background:' + (window.RN_SERVER_ONLINE ? '#22c55e' : '#f97316') + ';display:inline-block"></span>';
-        const render = () => {
-            const ip = (window.RN_LAN_IP || (window.RN_SERVER || '').replace(/^https?:\/\//, '').replace(/:\d+.*$/, '')) || '…';
-            pill.innerHTML = dot() + ' <span>' + ip + '</span>';
-        };
-        pill.addEventListener('click', () => window.RN_ShowServerPanel());
-        document.body.appendChild(pill);
-        render();
-        setInterval(render, 3000);
-        document.addEventListener('rnserverready', render);
-    })();
-</script>
 </body>
 </html>
