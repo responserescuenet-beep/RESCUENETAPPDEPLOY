@@ -1017,8 +1017,13 @@ function ingestIncomingReport(report) {
 const MAP = {
     map: null, caseLayer: [], byCase: {}, mine: null, focus: null,
     accLayer: [], accByCase: {},
-    pov: false, routeLine: null, routeCaseId: null, bearingFrame: null,
+    pov: false, routeLine: null, routeGlow: null, routeCaseId: null, bearingFrame: null,
     manualBearing: false, applyingBearing: false, lastFollowAt: 0,
+    // Road-accurate guidance line (OSRM). routeCoords holds the real road
+    // geometry; routeKey caches the last routed endpoints (~11 m) so GPS
+    // jitter doesn't trigger a refetch; routeTimer debounces movement.
+    routeCoords: null, routeKey: '', routeFetching: false, routeTimer: null,
+    routeDistanceM: null, routeDurationS: null,
     unitsLayer: [], unitsById: {}, showUnits: true
 };
 
@@ -1080,112 +1085,126 @@ function updatePovControls() {
     if (MAP.pov && c) updatePovRoute(c);
 }
 
-/* --- POV guidance: road-accurate route with a direct-line fallback --- */
-const POV_ROUTE = { busy: false, key: '', at: 0, loadedFor: null };
-const POV_ROAD_REFRESH_MS = 12000;
-/* How far below the vertical centre the unit sits in POV (third-person framing). */
-const POV_CHASE_OFFSET = 0.16;
-
-function fmtEta(seconds) {
-    if (seconds == null || !Number.isFinite(seconds)) return '';
-    if (seconds < 60) return Math.round(seconds) + 's';
-    if (seconds < 3600) return Math.round(seconds / 60) + ' min';
-    const h = Math.floor(seconds / 3600);
-    const m = Math.round((seconds % 3600) / 60);
-    return h + 'h' + (m > 0 ? ' ' + m + ' min' : '');
-}
-
-function povFixNote(c) {
-    const accuracy = Number(c.accuracy);
-    return (Number.isFinite(accuracy) && accuracy > 0)
-        ? ' · fix ±' + Math.round(accuracy) + ' m' : '';
-}
-
-function setPovDistanceText(text) {
-    const el = $('#povDistance');
-    if (el) el.textContent = text;
-}
-
-function setPovRouteLine(points) {
-    if (!MAP.map) return;
+/* Draw (or reposition) the guidance line for a given path. OSRM's road
+ * geometry can have hundreds of points, so the polyline is reused and only
+ * its lat/lngs are swapped once it exists. */
+function drawPovRoutePath(path) {
+    if (!MAP.map || typeof L === 'undefined') return;
     if (MAP.routeLine) {
-        MAP.routeLine.setLatLngs(points);
-    } else {
-        MAP.routeLine = L.polyline(points, {
-            className: 'pov-route-line',
-            color: '#1677ff',
-            weight: 6,
-            opacity: 0.9,
-            lineCap: 'round',
-            lineJoin: 'round',
-            dashArray: '12 8',
-            interactive: false
-        }).addTo(MAP.map);
+        try { MAP.routeLine.setLatLngs(path); } catch (e) {}
+        if (MAP.routeGlow) { try { MAP.routeGlow.setLatLngs(path); } catch (e) {} }
+        return;
     }
+    MAP.routeGlow = L.polyline(path, {
+        className: 'pov-route-glow', color: '#1677ff', weight: 14, opacity: 0.18,
+        lineCap: 'round', lineJoin: 'round', interactive: false
+    }).addTo(MAP.map);
+    MAP.routeLine = L.polyline(path, {
+        className: 'pov-route-line', color: '#1677ff', weight: 6, opacity: 0.95,
+        lineCap: 'round', lineJoin: 'round', dashArray: '12 8', interactive: false
+    }).addTo(MAP.map);
 }
 
-/* Ask OSRM for the real driving path so the guidance line follows the roads.
- * Falls back to the direct line whenever the service is offline, slow, or blocked. */
-function fetchPovRoadRoute(c, target) {
-    if (POV_ROUTE.busy) return;
-    const key = ME_POS.lat.toFixed(4) + ',' + ME_POS.lng.toFixed(4)
-        + ';' + target.lat.toFixed(5) + ',' + target.lng.toFixed(5);
-    if (key === POV_ROUTE.key && (Date.now() - POV_ROUTE.at) < POV_ROAD_REFRESH_MS) return;
-    POV_ROUTE.busy = true;
-    POV_ROUTE.key = key;
-    POV_ROUTE.at = Date.now();
+function povRouteKey(a, b) {
+    // 4 decimals ≈ 11 m — small enough to track real movement, coarse enough
+    // that standing-still GPS jitter never retriggers a network request.
+    return a.lat.toFixed(4) + ',' + a.lng.toFixed(4) + '|' + b.lat.toFixed(4) + ',' + b.lng.toFixed(4);
+}
+
+function updatePovDistance(c, target) {
+    const el = $('#povDistance');
+    if (!el) return;
+    const usingRoad = !!MAP.routeCoords && MAP.routeDistanceM != null && MAP.routeCaseId === c.id;
+    const meters = usingRoad ? MAP.routeDistanceM : metersBetween(ME_POS, target);
+    const accuracy = Number(c.accuracy);
+    const precision = Number.isFinite(accuracy) && accuracy > 0
+        ? ' · resident fix ±' + Math.round(accuracy) + ' m' : '';
+    let txt = usingRoad ? 'Road route · ' + fmtDist(meters)
+                        : 'Locating route · ' + fmtDist(meters) + ' straight line';
+    if (usingRoad && MAP.routeDurationS != null) txt += ' · ETA ' + fmtDur(MAP.routeDurationS);
+    el.textContent = txt + precision;
+}
+
+function fmtDur(sec) {
+    if (sec == null || !isFinite(sec)) return '—';
+    sec = Math.max(0, Math.round(sec));
+    if (sec < 60) return sec + 's';
+    const m = Math.round(sec / 60);
+    if (m < 60) return m + ' min';
+    const h = Math.floor(m / 60);
+    return h + 'h ' + (m % 60) + 'm';
+}
+
+/* Fetch the real driving route from the resident's precise SOS pin. Debounced
+ * so frequent GPS updates coalesce into a single request; times out and falls
+ * back to the straight line already drawn if OSRM is unreachable. */
+function fetchPovRoute(c) {
+    if (!MAP.map || !ME_POS || !Number.isFinite(ME_POS.lat) || !Number.isFinite(ME_POS.lng)) return;
+    if (MAP.routeFetching) return;
+    const target = { lat: Number(c.latitude), lng: Number(c.longitude) };
+    if (!Number.isFinite(target.lat) || !Number.isFinite(target.lng)) return;
+    const key = povRouteKey(ME_POS, target);
+    if (key === MAP.routeKey && MAP.routeCoords && MAP.routeCaseId === c.id) return;
 
     const url = 'https://router.project-osrm.org/route/v1/driving/'
         + ME_POS.lng.toFixed(6) + ',' + ME_POS.lat.toFixed(6) + ';'
         + target.lng.toFixed(6) + ',' + target.lat.toFixed(6)
         + '?overview=full&geometries=geojson&alternatives=false&steps=false';
+
+    MAP.routeFetching = true;
     const ctl = ('AbortController' in window) ? new AbortController() : null;
-    const timeout = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 6000) : null;
+    const killer = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 6000) : null;
 
     fetch(url, ctl ? { signal: ctl.signal, mode: 'cors' } : { mode: 'cors' })
         .then(r => r.ok ? r.json() : Promise.reject(new Error('OSRM ' + r.status)))
         .then(j => {
-            const rt = j && j.routes && j.routes[0];
-            if (!rt || !rt.geometry || !rt.geometry.coordinates || rt.geometry.coordinates.length < 2) return;
-            const live = focusedNavigationCase();
-            if (!MAP.pov || !live || live.id !== c.id) return; // drop stale response
-            setPovRouteLine(rt.geometry.coordinates.map(p => [p[1], p[0]]));
+            const route = j && j.routes && j.routes[0];
+            const coords = route && route.geometry && route.geometry.coordinates;
+            if (!coords || !coords.length) return;
+            // OSRM returns [lng,lat]; Leaflet wants [lat,lng].
+            const path = coords.map(p => [p[1], p[0]]);
+            MAP.routeCoords = path;
+            MAP.routeKey = key;
             MAP.routeCaseId = c.id;
-            POV_ROUTE.loadedFor = c.id;
-            const distM = Number(rt.distance);
-            const eta = fmtEta(Number(rt.duration));
-            setPovDistanceText((Number.isFinite(distM) ? fmtDist(Math.round(distM)) : '—')
-                + ' by road' + (eta ? ' · ETA ' + eta : '') + povFixNote(c));
+            MAP.routeDistanceM = route.distance != null ? Number(route.distance) : null;
+            MAP.routeDurationS = route.duration != null ? Number(route.duration) : null;
+            drawPovRoutePath(path);
+            updatePovDistance(c, target);
         })
-        .catch(() => { /* offline / blocked → keep the direct-line fallback */ })
+        .catch(() => { MAP.routeKey = ''; })
         .finally(() => {
-            if (timeout) clearTimeout(timeout);
-            POV_ROUTE.busy = false;
+            MAP.routeFetching = false;
+            if (killer) clearTimeout(killer);
         });
 }
 
 function updatePovRoute(c) {
     if (!MAP.map || !ME_POS || !Number.isFinite(ME_POS.lat) || !Number.isFinite(ME_POS.lng)) return;
     const target = { lat: Number(c.latitude), lng: Number(c.longitude) };
-    // Keep the road path once we have it; otherwise refresh the direct baseline.
-    const roadLoaded = MAP.routeLine && MAP.routeCaseId === c.id && POV_ROUTE.loadedFor === c.id;
-    if (!roadLoaded) {
-        setPovRouteLine([[ME_POS.lat, ME_POS.lng], [target.lat, target.lng]]);
-        MAP.routeCaseId = c.id;
-        setPovDistanceText('Direct line · ' + fmtDist(metersBetween(ME_POS, target)) + povFixNote(c));
-    }
-    fetchPovRoadRoute(c, target);
-}
+    if (!Number.isFinite(target.lat) || !Number.isFinite(target.lng)) return;
 
-/* Third-person chase framing: keep the unit horizontally centred but lower in
- * the frame so the route ahead stays visible as the responder moves. */
-function povFollowLook() {
-    if (!MAP.map || !ME_POS) return;
-    const size = MAP.map.getSize();
-    if (!size || !size.y) return;
-    const unit = MAP.map.latLngToContainerPoint([ME_POS.lat, ME_POS.lng]);
-    const anchor = L.point(unit.x, unit.y - size.y * POV_CHASE_OFFSET);
-    MAP.map.panTo(MAP.map.containerPointToLatLng(anchor), { animate: true, duration: 0.55, easeLinearity: 0.25 });
+    // A new case wipes the cached road geometry so the previous case's route
+    // is never mistaken for this one.
+    if (MAP.routeCaseId !== c.id) {
+        MAP.routeCaseId = c.id;
+        MAP.routeCoords = null;
+        MAP.routeKey = '';
+        MAP.routeDistanceM = null;
+        MAP.routeDurationS = null;
+        if (MAP.routeLine) { try { MAP.map.removeLayer(MAP.routeLine); } catch (e) {} MAP.routeLine = null; }
+        if (MAP.routeGlow) { try { MAP.map.removeLayer(MAP.routeGlow); } catch (e) {} MAP.routeGlow = null; }
+    }
+
+    // Seed immediately with the straight line so guidance is never blank while
+    // the (slower) road route loads; the OSRM result replaces it moments later.
+    if (!MAP.routeCoords) {
+        drawPovRoutePath([[ME_POS.lat, ME_POS.lng], [target.lat, target.lng]]);
+    }
+
+    if (MAP.routeTimer) clearTimeout(MAP.routeTimer);
+    MAP.routeTimer = setTimeout(() => fetchPovRoute(c), 1200);
+
+    updatePovDistance(c, target);
 }
 
 function startPovNavigation() {
@@ -1199,9 +1218,7 @@ function startPovNavigation() {
     MAP.manualBearing = false;
     MAP.routeCaseId = null;
     if (MAP.map && hasMapRotation()) {
-        // Negate the compass bearing: leaflet-rotate's setBearing rotates the map
-        // clockwise, so -bearing puts the direction of travel at the top of the view.
-        animateMapBearing(-bearingBetween(ME_POS, { lat: Number(c.latitude), lng: Number(c.longitude) }), 420);
+        animateMapBearing(bearingBetween(ME_POS, { lat: Number(c.latitude), lng: Number(c.longitude) }), 420);
     }
     updatePovControls();
     drawMine();
@@ -1213,13 +1230,16 @@ function stopPovNavigation(showMessage) {
     MAP.pov = false;
     MAP.manualBearing = false;
     MAP.lastFollowAt = 0;
+    if (MAP.routeTimer) { clearTimeout(MAP.routeTimer); MAP.routeTimer = null; }
     if (MAP.routeLine && MAP.map) MAP.map.removeLayer(MAP.routeLine);
+    if (MAP.routeGlow && MAP.map) MAP.map.removeLayer(MAP.routeGlow);
     MAP.routeLine = null;
+    MAP.routeGlow = null;
     MAP.routeCaseId = null;
-    POV_ROUTE.busy = false;
-    POV_ROUTE.key = '';
-    POV_ROUTE.at = 0;
-    POV_ROUTE.loadedFor = null;
+    MAP.routeCoords = null;
+    MAP.routeKey = '';
+    MAP.routeDistanceM = null;
+    MAP.routeDurationS = null;
     const toolbar = $('#povToolbar');
     const distance = $('#povDistance');
     if (toolbar) toolbar.classList.remove('navigating');
@@ -1784,7 +1804,7 @@ function drawMine() {
             const now = Date.now();
             if (now - MAP.lastFollowAt > 900) {
                 MAP.lastFollowAt = now;
-                povFollowLook();
+                MAP.map.panTo([ME_POS.lat, ME_POS.lng], { animate: true, duration: 0.45 });
             }
             if (!MAP.manualBearing && hasMapRotation() && Number.isFinite(ME_POS.heading)
                 && Number.isFinite(ME_POS.speed) && ME_POS.speed > 0.8) {
