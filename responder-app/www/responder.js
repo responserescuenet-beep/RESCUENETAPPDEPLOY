@@ -1080,14 +1080,37 @@ function updatePovControls() {
     if (MAP.pov && c) updatePovRoute(c);
 }
 
-function updatePovRoute(c) {
-    if (!MAP.map || !ME_POS || !Number.isFinite(ME_POS.lat) || !Number.isFinite(ME_POS.lng)) return;
-    const target = { lat: Number(c.latitude), lng: Number(c.longitude) };
-    const points = [[ME_POS.lat, ME_POS.lng], [target.lat, target.lng]];
-    if (MAP.routeLine && MAP.routeCaseId === c.id) {
+/* --- POV guidance: road-accurate route with a direct-line fallback --- */
+const POV_ROUTE = { busy: false, key: '', at: 0, loadedFor: null };
+const POV_ROAD_REFRESH_MS = 12000;
+/* How far below the vertical centre the unit sits in POV (third-person framing). */
+const POV_CHASE_OFFSET = 0.16;
+
+function fmtEta(seconds) {
+    if (seconds == null || !Number.isFinite(seconds)) return '';
+    if (seconds < 60) return Math.round(seconds) + 's';
+    if (seconds < 3600) return Math.round(seconds / 60) + ' min';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.round((seconds % 3600) / 60);
+    return h + 'h' + (m > 0 ? ' ' + m + ' min' : '');
+}
+
+function povFixNote(c) {
+    const accuracy = Number(c.accuracy);
+    return (Number.isFinite(accuracy) && accuracy > 0)
+        ? ' · fix ±' + Math.round(accuracy) + ' m' : '';
+}
+
+function setPovDistanceText(text) {
+    const el = $('#povDistance');
+    if (el) el.textContent = text;
+}
+
+function setPovRouteLine(points) {
+    if (!MAP.map) return;
+    if (MAP.routeLine) {
         MAP.routeLine.setLatLngs(points);
     } else {
-        if (MAP.routeLine) MAP.map.removeLayer(MAP.routeLine);
         MAP.routeLine = L.polyline(points, {
             className: 'pov-route-line',
             color: '#1677ff',
@@ -1098,13 +1121,71 @@ function updatePovRoute(c) {
             dashArray: '12 8',
             interactive: false
         }).addTo(MAP.map);
-        MAP.routeCaseId = c.id;
     }
-    const distance = metersBetween(ME_POS, target);
-    const accuracy = Number(c.accuracy);
-    const precision = Number.isFinite(accuracy) && accuracy > 0
-        ? ' · resident fix ±' + Math.round(accuracy) + ' m' : '';
-    $('#povDistance').textContent = 'Straight-line guidance · ' + fmtDist(distance) + precision;
+}
+
+/* Ask OSRM for the real driving path so the guidance line follows the roads.
+ * Falls back to the direct line whenever the service is offline, slow, or blocked. */
+function fetchPovRoadRoute(c, target) {
+    if (POV_ROUTE.busy) return;
+    const key = ME_POS.lat.toFixed(4) + ',' + ME_POS.lng.toFixed(4)
+        + ';' + target.lat.toFixed(5) + ',' + target.lng.toFixed(5);
+    if (key === POV_ROUTE.key && (Date.now() - POV_ROUTE.at) < POV_ROAD_REFRESH_MS) return;
+    POV_ROUTE.busy = true;
+    POV_ROUTE.key = key;
+    POV_ROUTE.at = Date.now();
+
+    const url = 'https://router.project-osrm.org/route/v1/driving/'
+        + ME_POS.lng.toFixed(6) + ',' + ME_POS.lat.toFixed(6) + ';'
+        + target.lng.toFixed(6) + ',' + target.lat.toFixed(6)
+        + '?overview=full&geometries=geojson&alternatives=false&steps=false';
+    const ctl = ('AbortController' in window) ? new AbortController() : null;
+    const timeout = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) {} }, 6000) : null;
+
+    fetch(url, ctl ? { signal: ctl.signal, mode: 'cors' } : { mode: 'cors' })
+        .then(r => r.ok ? r.json() : Promise.reject(new Error('OSRM ' + r.status)))
+        .then(j => {
+            const rt = j && j.routes && j.routes[0];
+            if (!rt || !rt.geometry || !rt.geometry.coordinates || rt.geometry.coordinates.length < 2) return;
+            const live = focusedNavigationCase();
+            if (!MAP.pov || !live || live.id !== c.id) return; // drop stale response
+            setPovRouteLine(rt.geometry.coordinates.map(p => [p[1], p[0]]));
+            MAP.routeCaseId = c.id;
+            POV_ROUTE.loadedFor = c.id;
+            const distM = Number(rt.distance);
+            const eta = fmtEta(Number(rt.duration));
+            setPovDistanceText((Number.isFinite(distM) ? fmtDist(Math.round(distM)) : '—')
+                + ' by road' + (eta ? ' · ETA ' + eta : '') + povFixNote(c));
+        })
+        .catch(() => { /* offline / blocked → keep the direct-line fallback */ })
+        .finally(() => {
+            if (timeout) clearTimeout(timeout);
+            POV_ROUTE.busy = false;
+        });
+}
+
+function updatePovRoute(c) {
+    if (!MAP.map || !ME_POS || !Number.isFinite(ME_POS.lat) || !Number.isFinite(ME_POS.lng)) return;
+    const target = { lat: Number(c.latitude), lng: Number(c.longitude) };
+    // Keep the road path once we have it; otherwise refresh the direct baseline.
+    const roadLoaded = MAP.routeLine && MAP.routeCaseId === c.id && POV_ROUTE.loadedFor === c.id;
+    if (!roadLoaded) {
+        setPovRouteLine([[ME_POS.lat, ME_POS.lng], [target.lat, target.lng]]);
+        MAP.routeCaseId = c.id;
+        setPovDistanceText('Direct line · ' + fmtDist(metersBetween(ME_POS, target)) + povFixNote(c));
+    }
+    fetchPovRoadRoute(c, target);
+}
+
+/* Third-person chase framing: keep the unit horizontally centred but lower in
+ * the frame so the route ahead stays visible as the responder moves. */
+function povFollowLook() {
+    if (!MAP.map || !ME_POS) return;
+    const size = MAP.map.getSize();
+    if (!size || !size.y) return;
+    const unit = MAP.map.latLngToContainerPoint([ME_POS.lat, ME_POS.lng]);
+    const anchor = L.point(unit.x, unit.y - size.y * POV_CHASE_OFFSET);
+    MAP.map.panTo(MAP.map.containerPointToLatLng(anchor), { animate: true, duration: 0.55, easeLinearity: 0.25 });
 }
 
 function startPovNavigation() {
@@ -1118,7 +1199,9 @@ function startPovNavigation() {
     MAP.manualBearing = false;
     MAP.routeCaseId = null;
     if (MAP.map && hasMapRotation()) {
-        animateMapBearing(bearingBetween(ME_POS, { lat: Number(c.latitude), lng: Number(c.longitude) }), 420);
+        // Negate the compass bearing: leaflet-rotate's setBearing rotates the map
+        // clockwise, so -bearing puts the direction of travel at the top of the view.
+        animateMapBearing(-bearingBetween(ME_POS, { lat: Number(c.latitude), lng: Number(c.longitude) }), 420);
     }
     updatePovControls();
     drawMine();
@@ -1133,6 +1216,10 @@ function stopPovNavigation(showMessage) {
     if (MAP.routeLine && MAP.map) MAP.map.removeLayer(MAP.routeLine);
     MAP.routeLine = null;
     MAP.routeCaseId = null;
+    POV_ROUTE.busy = false;
+    POV_ROUTE.key = '';
+    POV_ROUTE.at = 0;
+    POV_ROUTE.loadedFor = null;
     const toolbar = $('#povToolbar');
     const distance = $('#povDistance');
     if (toolbar) toolbar.classList.remove('navigating');
@@ -1697,7 +1784,7 @@ function drawMine() {
             const now = Date.now();
             if (now - MAP.lastFollowAt > 900) {
                 MAP.lastFollowAt = now;
-                MAP.map.panTo([ME_POS.lat, ME_POS.lng], { animate: true, duration: 0.45 });
+                povFollowLook();
             }
             if (!MAP.manualBearing && hasMapRotation() && Number.isFinite(ME_POS.heading)
                 && Number.isFinite(ME_POS.speed) && ME_POS.speed > 0.8) {
