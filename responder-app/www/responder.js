@@ -1019,6 +1019,9 @@ const MAP = {
     accLayer: [], accByCase: {},
     pov: false, routeLine: null, routeGlow: null, routeCaseId: null, bearingFrame: null,
     manualBearing: false, applyingBearing: false, lastFollowAt: 0,
+    // manualPan flips true the moment the responder drags the map so the
+    // auto-follow camera stops snapping back; tapping the recenter FAB resumes.
+    manualPan: false, prevFix: null, movementHeading: null,
     // Road-accurate guidance line (OSRM). routeCoords holds the real road
     // geometry; routeKey caches the last routed endpoints (~11 m) so GPS
     // jitter doesn't trigger a refetch; routeTimer debounces movement.
@@ -1101,7 +1104,7 @@ function drawPovRoutePath(path) {
     }).addTo(MAP.map);
     MAP.routeLine = L.polyline(path, {
         className: 'pov-route-line', color: '#1677ff', weight: 6, opacity: 0.95,
-        lineCap: 'round', lineJoin: 'round', dashArray: '12 8', interactive: false
+        lineCap: 'round', lineJoin: 'round', interactive: false
     }).addTo(MAP.map);
 }
 
@@ -1216,7 +1219,11 @@ function startPovNavigation() {
     }
     MAP.pov = true;
     MAP.manualBearing = false;
+    MAP.manualPan = false;
+    MAP.prevFix = null;
+    MAP.movementHeading = null;
     MAP.routeCaseId = null;
+    applyPovTilt(true);
     if (MAP.map && hasMapRotation()) {
         animateMapBearing(bearingBetween(ME_POS, { lat: Number(c.latitude), lng: Number(c.longitude) }), 420);
     }
@@ -1229,7 +1236,11 @@ function startPovNavigation() {
 function stopPovNavigation(showMessage) {
     MAP.pov = false;
     MAP.manualBearing = false;
+    MAP.manualPan = false;
+    MAP.prevFix = null;
+    MAP.movementHeading = null;
     MAP.lastFollowAt = 0;
+    applyPovTilt(false);
     if (MAP.routeTimer) { clearTimeout(MAP.routeTimer); MAP.routeTimer = null; }
     if (MAP.routeLine && MAP.map) MAP.map.removeLayer(MAP.routeLine);
     if (MAP.routeGlow && MAP.map) MAP.map.removeLayer(MAP.routeGlow);
@@ -1298,6 +1309,19 @@ function ensureMap() {
             if (!MAP.applyingBearing && MAP.pov) MAP.manualBearing = true;
         });
     }
+    /* A user drag pauses the POV follow-camera (no snap-back); the recenter
+     * FAB resumes it. Only the human 'dragstart' counts — programmatic
+     * panTo() does not emit it, so auto-follow itself never trips this.
+     * The 3D POV tilt is also suspended while dragging so Leaflet's
+     * pixel-accurate drag maths are never distorted by the CSS transform. */
+    MAP.map.on('dragstart', () => {
+        if (!MAP.pov) return;
+        MAP.manualPan = true;
+        MAP.manualBearing = true;
+        applyPovTilt(false);
+        const btn = $('#recenterBtn');
+        if (btn) btn.classList.add('active');
+    });
     addTileLayer(MAP.map);
     // Ensure tiles render correctly after the map container becomes visible
     setTimeout(() => { try { MAP.map && MAP.map.invalidateSize(); } catch(e){} }, 150);
@@ -1801,17 +1825,46 @@ function drawMine() {
         const c = focusedNavigationCase();
         if (c) {
             updatePovRoute(c);
-            const now = Date.now();
-            if (now - MAP.lastFollowAt > 900) {
-                MAP.lastFollowAt = now;
-                MAP.map.panTo([ME_POS.lat, ME_POS.lng], { animate: true, duration: 0.45 });
+            if (!MAP.manualPan) {
+                const now = Date.now();
+                if (now - MAP.lastFollowAt > 700) {
+                    MAP.lastFollowAt = now;
+                    povFollowLook();
+                }
             }
-            if (!MAP.manualBearing && hasMapRotation() && Number.isFinite(ME_POS.heading)
-                && Number.isFinite(ME_POS.speed) && ME_POS.speed > 0.8) {
-                animateMapBearing(-ME_POS.heading, 500);
+            // Prefer the direction actually travelled (derived from the last
+            // fixes) over the device compass, which is often null or noisy on
+            // Android; fall back to the reported heading.
+            const heading = Number.isFinite(MAP.movementHeading) ? MAP.movementHeading
+                          : (Number.isFinite(ME_POS.heading) ? ME_POS.heading : null);
+            if (!MAP.manualBearing && hasMapRotation() && Number.isFinite(heading)) {
+                animateMapBearing(-heading, 500);
             }
         }
     }
+}
+
+/* Chase-cam framing: keep the responder unit horizontally centred and ~20%
+ * below the vertical centre so the road ahead fills the upper screen — the
+ * tilted third-person look. Uses container-point maths so it stays correct
+ * whichever way the map is rotated. */
+function povFollowLook() {
+    if (!MAP.map || !ME_POS || !Number.isFinite(ME_POS.lat) || !Number.isFinite(ME_POS.lng)) return;
+    const size = MAP.map.getSize();
+    const mePt = MAP.map.latLngToContainerPoint([ME_POS.lat, ME_POS.lng]);
+    const lookPt = L.point(mePt.x, mePt.y - size.y * 0.20);
+    const center = MAP.map.containerPointToLatLng(lookPt);
+    MAP.map.panTo(center, { animate: true, duration: 0.5 });
+}
+
+/* Third-person POV tilt: a 3D lean-back on the map tiles gives the "navigation
+ * camera" feel (horizon high, road rushing toward the viewer). It lives on the
+ * .map-box wrapper and is only active during POV follow; dragging calls this
+ * with false so Leaflet's pixel-accurate drag maths are never distorted, and
+ * the recenter FAB turns it back on. */
+function applyPovTilt(on) {
+    const box = document.querySelector('.map-box');
+    if (box) box.classList.toggle('pov-tilt', !!on);
 }
 
 /* ---------- other responder units on the map ----------
@@ -1924,8 +1977,21 @@ function bindClick(id, handler) {
 }
 bindClick('recenterBtn', () => {
     ensureMap(); if (!MAP.map) return;
-    if (ME_POS) MAP.map.flyTo([ME_POS.lat, ME_POS.lng], 16);
-    else toast('Waiting for your GPS fix…');
+    // Tapping recenter hands control back to the auto-follow camera: clear the
+    // manual-pan/bearing locks (so the map stops staying where it was dragged)
+    // and re-apply the POV tilt that dragging suspends.
+    MAP.manualPan = false;
+    MAP.manualBearing = false;
+    const btn = $('#recenterBtn');
+    if (btn) btn.classList.remove('active');
+    if (!ME_POS) { toast('Waiting for your GPS fix…'); return; }
+    if (MAP.pov) {
+        applyPovTilt(true);
+        MAP.lastFollowAt = 0;
+        povFollowLook();
+    } else {
+        MAP.map.flyTo([ME_POS.lat, ME_POS.lng], 16);
+    }
 });
 bindClick('unitsBtn', toggleUnits);
 bindClick('rotateLeftBtn', () => {
@@ -1986,9 +2052,19 @@ function startOwnWatch() {
     if (prefs.loc === false) { setGpsChip('searching', 'Location sharing is off'); return; }
 
     const onOk = (pos) => {
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        // Derive the direction of travel from the last two fixes — far steadier
+        // than the Android device compass (pos.coords.heading is often null or
+        // noisy). Only update once the unit has actually moved a few metres so
+        // GPS jitter can't spin the POV camera.
+        if (MAP.prevFix && metersBetween(MAP.prevFix, { lat, lng }) > 4) {
+            MAP.movementHeading = bearingBetween(MAP.prevFix, { lat, lng });
+        }
+        MAP.prevFix = { lat, lng };
         ME_POS = {
-            lat: pos.coords.latitude,
-            lng: pos.coords.longitude,
+            lat: lat,
+            lng: lng,
             acc: pos.coords.accuracy,
             heading: Number.isFinite(pos.coords.heading) ? pos.coords.heading : null,
             speed: Number.isFinite(pos.coords.speed) ? pos.coords.speed : null

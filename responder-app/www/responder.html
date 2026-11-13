@@ -606,6 +606,17 @@ body.map-fullscreen .stage { padding-top: 0; overflow: hidden; }
 .pov-route-line { color: #1677ff; }
 .pov-route-glow { color: #1677ff; }
 
+/* Third-person POV tilt — a 3D lean-back on the map tiles for the navigation
+ * camera feel (horizon high, road rushing toward the viewer). Applied only
+ * while POV follow is active; the responder's drag removes it so Leaflet's
+ * pixel-accurate drag maths are never distorted, and recenter re-applies it.
+ * The scale keeps the rotated/scaled tiles covering the clipped .map-box. */
+.map-box.pov-tilt #respMap {
+    transform: perspective(1000px) rotateX(26deg) scale(1.4);
+    transform-origin: 50% 50%;
+    will-change: transform;
+}
+
 /* ---------- other responder unit pins ---------- */
 .unit-marker { background: transparent; border: 0; }
 .unit-marker span {
