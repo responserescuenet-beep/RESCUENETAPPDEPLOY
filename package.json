@@ -1,0 +1,30 @@
+{
+  "name": "rescuenet-root",
+  "private": true,
+  "version": "1.0.0",
+  "description": "RescueNet — barangay emergency response. Root workspace hosting the resident app and the responder-app (sibling Capacitor project).",
+  "scripts": {
+    "start": "node server.js",
+    "start:ngrok": "node server.js --ngrok",
+    "tunnel": "node server.js --tunnel-only",
+    "gateway": "\"C:/xampp/php/php.exe\" -S 0.0.0.0:3000 -t www php-backend/dev-router.php",
+    "sync:resident": "npx cap sync android",
+    "sync:responder": "npm --prefix responder-app run sync",
+    "build:resident": "npx cap sync android && cd android && gradlew.bat assembleDebug",
+    "build:responder": "npm --prefix responder-app run build",
+    "open:resident": "npx cap open android",
+    "open:responder": "npm --prefix responder-app run open",
+    "responder:init": "cd responder-app && npx cap add android"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.5.0",
+    "@capacitor/app": "^8.1.2",
+    "@capacitor/camera": "^8.2.4",
+    "@capacitor/cli": "^8.5.0",
+    "@capacitor/core": "^8.5.0",
+    "@capacitor/geolocation": "^8.2.3",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "nodemailer": "^10.0.12"
+  }
+}

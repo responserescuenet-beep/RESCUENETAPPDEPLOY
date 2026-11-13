@@ -1,0 +1,37 @@
+# ============================================================================
+#  RescueNet — Apache configuration (InfinityFree / htdocs)
+#  Uploaded to the web root alongside the static app files + the /api folder.
+# ============================================================================
+
+RewriteEngine On
+
+# 1) Real files and directories (the static HTML/CSS/JS apps) are served as-is.
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^ - [L]
+
+# 2) Every /api/* request goes through the single PHP front controller.
+RewriteRule ^api(/.*)?$ api/index.php [QSA,L]
+
+# 3) The Maps SDK key script is generated dynamically (key never in the HTML).
+RewriteRule ^maps-key\.js$ api/maps-key.php [L]
+
+# ---- Hardening -------------------------------------------------------------
+# Never expose the backend source, config or schema over HTTP.
+<FilesMatch "\.(sql|md|key|log)$">
+  Require all denied
+</FilesMatch>
+# config.php lives inside /api and must be includable by PHP but not fetchable.
+<Files "config.php">
+  Require all denied
+</Files>
+
+# Keep API responses out of every cache.
+<IfModule mod_headers.c>
+  <FilesMatch "^index\.php$">
+    Header set Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
+  </FilesMatch>
+</IfModule>
+
+# UTF-8 by default.
+AddDefaultCharset UTF-8
