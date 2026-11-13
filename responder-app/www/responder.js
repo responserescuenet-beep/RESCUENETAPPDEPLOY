@@ -1090,7 +1090,14 @@ function updatePovControls() {
 
 /* Draw (or reposition) the guidance line for a given path. OSRM's road
  * geometry can have hundreds of points, so the polyline is reused and only
- * its lat/lngs are swapped once it exists. */
+ * its lat/lngs are swapped once it exists.
+ *
+ * Two stacked strokes give the crisp, professional navigation look: a thin
+ * navy casing underneath for definition against busy map tiles, and a solid
+ * blue core on top (same blue as the POV position dot). Rounded caps/joins
+ * and no blur — just a clean, even-width line. */
+const POV_ROUTE_BLUE = '#1677ff';
+const POV_ROUTE_CASING = '#0D2A63';
 function drawPovRoutePath(path) {
     if (!MAP.map || typeof L === 'undefined') return;
     if (MAP.routeLine) {
@@ -1098,12 +1105,14 @@ function drawPovRoutePath(path) {
         if (MAP.routeGlow) { try { MAP.routeGlow.setLatLngs(path); } catch (e) {} }
         return;
     }
+    // Casing (under-stroke): slightly wider navy line that outlines the route.
     MAP.routeGlow = L.polyline(path, {
-        className: 'pov-route-glow', color: '#1677ff', weight: 14, opacity: 0.18,
+        className: 'pov-route-glow', color: POV_ROUTE_CASING, weight: 10, opacity: 0.35,
         lineCap: 'round', lineJoin: 'round', interactive: false
     }).addTo(MAP.map);
+    // Core: solid blue, full opacity — the line the responder actually follows.
     MAP.routeLine = L.polyline(path, {
-        className: 'pov-route-line', color: '#1677ff', weight: 6, opacity: 0.95,
+        className: 'pov-route-line', color: POV_ROUTE_BLUE, weight: 5.5, opacity: 1,
         lineCap: 'round', lineJoin: 'round', interactive: false
     }).addTo(MAP.map);
 }
